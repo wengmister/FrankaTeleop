@@ -79,24 +79,37 @@ int main(int argc, char* argv[])
 
   // The dynamically updated target pose.
   PoseCommand target_pose;
-  target_pose.frame_id = servo_params.planning_frame;
-  // Initializing the target pose as end effector pose, this can be any pose.
-  target_pose.pose = servo.getEndEffectorPose();
+  target_pose.frame_id = planning_scene_monitor->getRobotModel()->getModelFrame();
+
+  // Get the end-effector link name from the move group
+  const std::string move_group_name = servo_params.move_group_name;
+  const moveit::core::JointModelGroup* joint_model_group = planning_scene_monitor->getRobotModel()->getJointModelGroup(move_group_name);
+  const std::string end_effector_link = joint_model_group->getLinkModelNames().back(); // Assuming the last link is the end-effector
+
+  // Get the current state of the robot
+  moveit::core::RobotStatePtr current_state = planning_scene_monitor->getStateMonitor()->getCurrentState();
+  target_pose.pose = current_state->getGlobalLinkTransform(end_effector_link);
 
   // The pose tracking lambda that will be run in a separate thread.
   auto pose_tracker = [&]() {
-    KinematicState joint_state;
+    std::deque<KinematicState> joint_states;
     rclcpp::WallRate tracking_rate(1 / servo_params.publish_period);
     while (rclcpp::ok())
     {
       {
         std::lock_guard<std::mutex> pguard(pose_guard);
-        joint_state = servo.getNextJointState(target_pose);
+        ServoInput servo_input = target_pose;
+        joint_states.push_back(servo.getNextJointState(current_state, servo_input));
       }
       StatusCode status = servo.getStatus();
       if (status != StatusCode::INVALID)
-        trajectory_outgoing_cmd_pub->publish(composeTrajectoryMessage(servo_params, joint_state));
-
+      {
+        auto trajectory_msg = composeTrajectoryMessage(servo_params, joint_states);
+        if (trajectory_msg)
+        {
+          trajectory_outgoing_cmd_pub->publish(*trajectory_msg);
+        }
+      }
       tracking_rate.sleep();
     }
   };
@@ -112,13 +125,14 @@ int main(int argc, char* argv[])
   {
     {
       std::lock_guard<std::mutex> pguard(pose_guard);
-      target_pose.pose = servo.getEndEffectorPose();
+      current_state = planning_scene_monitor->getStateMonitor()->getCurrentState();
+      target_pose.pose = current_state->getGlobalLinkTransform(end_effector_link);
       target_pose.pose.translate(linear_step_size);
       target_pose.pose.rotate(x_step_size);
       target_pose.pose.rotate(y_step_size);
       target_pose.pose.rotate(z_step_size);
-      rclcpp::spin_some(demo_node);
     }
+    rclcpp::spin_some(demo_node);
     command_rate.sleep();
   }
 
