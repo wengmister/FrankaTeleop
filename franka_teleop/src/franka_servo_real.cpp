@@ -1,12 +1,12 @@
-// load robot_model and robot_state
+/// load robot_model and robot_state
 #include <Eigen/Geometry>
 #include <Eigen/src/Geometry/Quaternion.h>
 #include <Eigen/src/Geometry/Transform.h>
 #include <atomic>
 #include "rclcpp/rclcpp.hpp"
 #include <chrono>
-#include <moveit_servo/servo.hpp>
-#include <moveit_servo/utils/common.hpp>
+#include <moveit_servo/moveit_servo/servo.hpp>
+#include <moveit_servo/moveit_servo/utils/common.hpp>
 #include <mutex>
 #include <std_srvs/srv/empty.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -22,8 +22,8 @@ static Eigen::AngleAxisd y_step_size(0.00, Eigen::Vector3d::UnitY());
 static Eigen::AngleAxisd z_step_size(0.00, Eigen::Vector3d::UnitZ());
 bool move_robot = false;
 
-/// \brief Callback for the robot_waypoints_service. This service sets the
-/// global variables for linear and rotational step size.
+/// \brief Callback for the robot_waypoints service.
+/// This service sets the global variables for linear and rotational step size.
 void waypoint_callback(const std::shared_ptr<franka_teleop::srv::PlanPath::Request> request,
                        std::shared_ptr<franka_teleop::srv::PlanPath::Response>)
 {
@@ -42,54 +42,66 @@ int main(int argc, char* argv[])
   std::this_thread::sleep_for(std::chrono::milliseconds(750));
   rclcpp::init(argc, argv);
 
-  // The servo object expects to get a ROS node.
+  // Create the ROS node.
   const rclcpp::Node::SharedPtr demo_node = std::make_shared<rclcpp::Node>("franka_servo");
 
-  // create services
-  rclcpp::Service<franka_teleop::srv::PlanPath>::SharedPtr service = demo_node->create_service<franka_teleop::srv::PlanPath>(
+  // Create service for updating waypoints.
+  auto service = demo_node->create_service<franka_teleop::srv::PlanPath>(
       "robot_waypoints", &waypoint_callback);
 
-  // Get the servo parameters.
+  // Get servo parameters.
   const std::string param_namespace = "moveit_servo";
-  const std::shared_ptr<const servo::ParamListener> servo_param_listener =
-      std::make_shared<const servo::ParamListener>(demo_node, param_namespace);
+  auto servo_param_listener = std::make_shared<const servo::ParamListener>(demo_node, param_namespace);
   const servo::Params servo_params = servo_param_listener->get_params();
 
-  // The publisher to send trajectory message to the robot controller.
-  rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr trajectory_outgoing_cmd_pub =
-      demo_node->create_publisher<trajectory_msgs::msg::JointTrajectory>(servo_params.command_out_topic,
-                                                                         rclcpp::SystemDefaultsQoS());
-  // Create the servo object
-  const planning_scene_monitor::PlanningSceneMonitorPtr planning_scene_monitor =
-      createPlanningSceneMonitor(demo_node, servo_params);
-  Servo servo = Servo(demo_node, servo_param_listener, planning_scene_monitor);
+  // Publisher for sending trajectory messages to the robot controller.
+  auto trajectory_outgoing_cmd_pub = demo_node->create_publisher<trajectory_msgs::msg::JointTrajectory>(
+      servo_params.command_out_topic, rclcpp::SystemDefaultsQoS());
 
-  // For syncing pose tracking thread and main thread.
+  // Create planning scene monitor and servo object.
+  auto planning_scene_monitor = createPlanningSceneMonitor(demo_node, servo_params);
+  Servo servo(demo_node, servo_param_listener, planning_scene_monitor);
+
+  // Synchronize the pose tracking thread with the main thread.
   std::mutex pose_guard;
 
-  // Set the command type for servo.
+  // Set the command type to POSE.
   servo.setCommandType(CommandType::POSE);
 
-  // The dynamically updated target pose.
-  PoseCommand target_pose;
-  target_pose.frame_id = servo_params.planning_frame;
-  // Initializing the target pose as end effector pose, this can be any pose.
-  target_pose.pose = servo.getEndEffectorPose();
+  // Get the end-effector link from the robot model.
+  const std::string move_group_name = servo_params.move_group_name;
+  const moveit::core::JointModelGroup* joint_model_group =
+      planning_scene_monitor->getRobotModel()->getJointModelGroup(move_group_name);
+  const std::string end_effector_link = joint_model_group->getLinkModelNames().back();
 
-  // The pose tracking lambda that will be run in a separate thread.
+  // Obtain the current robot state.
+  moveit::core::RobotStatePtr current_state =
+      planning_scene_monitor->getStateMonitor()->getCurrentState();
+
+  // Initialize the dynamically updated target pose.
+  PoseCommand target_pose;
+  target_pose.frame_id = planning_scene_monitor->getRobotModel()->getModelFrame();
+  target_pose.pose = current_state->getGlobalLinkTransform(end_effector_link);
+
+  // Pose tracking thread.
   auto pose_tracker = [&]() {
-    KinematicState joint_state;
+    std::deque<KinematicState> joint_states;
     rclcpp::WallRate tracking_rate(1 / servo_params.publish_period);
     while (rclcpp::ok())
     {
       {
         std::lock_guard<std::mutex> pguard(pose_guard);
-        joint_state = servo.getNextJointState(target_pose);
+        // Convert the target_pose to a ServoInput and get the next joint state.
+        ServoInput servo_input = target_pose;
+        joint_states.push_back(servo.getNextJointState(current_state, servo_input));
       }
       StatusCode status = servo.getStatus();
       if (status != StatusCode::INVALID)
-        trajectory_outgoing_cmd_pub->publish(composeTrajectoryMessage(servo_params, joint_state));
-
+      {
+        auto trajectory_msg = composeTrajectoryMessage(servo_params, joint_states);
+        if (trajectory_msg)
+          trajectory_outgoing_cmd_pub->publish(*trajectory_msg);
+      }
       tracking_rate.sleep();
     }
   };
@@ -97,21 +109,22 @@ int main(int argc, char* argv[])
   std::thread tracker_thread(pose_tracker);
   tracker_thread.detach();
 
-  // Frequency at which commands will be sent to the robot controller.
+  // Command loop: update target pose at a fixed rate.
   rclcpp::WallRate command_rate(50);
   RCLCPP_INFO_STREAM(demo_node->get_logger(), servo.getStatusMessage());
-
   while (rclcpp::ok())
   {
     {
       std::lock_guard<std::mutex> pguard(pose_guard);
-      target_pose.pose = servo.getEndEffectorPose();
+      // Update the current robot state and the target pose.
+      current_state = planning_scene_monitor->getStateMonitor()->getCurrentState();
+      target_pose.pose = current_state->getGlobalLinkTransform(end_effector_link);
       target_pose.pose.translate(linear_step_size);
       target_pose.pose.rotate(x_step_size);
       target_pose.pose.rotate(y_step_size);
       target_pose.pose.rotate(z_step_size);
-      rclcpp::spin_some(demo_node);
     }
+    rclcpp::spin_some(demo_node);
     command_rate.sleep();
   }
 
@@ -119,4 +132,5 @@ int main(int argc, char* argv[])
     tracker_thread.join();
 
   rclcpp::shutdown();
+  return 0;
 }

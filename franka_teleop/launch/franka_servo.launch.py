@@ -123,7 +123,8 @@ def generate_launch_description():
                 executable='joint_state_publisher',
                 name='joint_state_publisher',
                 parameters=[
-                    {'source_list': ['franka/joint_states', 'panda_gripper/joint_states'], 'rate': 30}],
+                    # {'source_list': ['franka/joint_states', 'panda_gripper/joint_states'], 'rate': 30}],
+                    {'source_list': ['franka/joint_states'], 'rate': 30}],
                 ),
             Node(
                 package="tf2_ros",
